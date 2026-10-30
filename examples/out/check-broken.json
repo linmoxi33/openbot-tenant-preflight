@@ -1,0 +1,76 @@
+{
+  "tool": "openbot-tenant-preflight",
+  "version": "0.1.0",
+  "command": "check",
+  "package": "/home/ubuntu/GitHub/work/trending/openbot-tenant-preflight/examples/in/broken",
+  "ok": false,
+  "summary": {
+    "errors": 7,
+    "warnings": 1,
+    "agents": 3,
+    "skills": 2,
+    "agent_ids": [
+      "policy",
+      "risk-analyst",
+      "expense-review"
+    ]
+  },
+  "findings": [
+    {
+      "severity": "error",
+      "code": "skill-slug-invalid",
+      "file": "skills.yaml",
+      "path": "skills[1].slug",
+      "message": "skill.slug \"Check_A_Claim\" must be lowercase letters, digits and hyphens, 2 to 40 characters, starting and ending with a letter or digit"
+    },
+    {
+      "severity": "error",
+      "code": "agent-id-reserved",
+      "file": "agents.yaml",
+      "path": "agents[0].id",
+      "message": "agent.id \"policy\" is reserved for a deployment route and cannot name a Bot"
+    },
+    {
+      "severity": "error",
+      "code": "agent-skill-unknown",
+      "file": "agents.yaml",
+      "path": "agents[0].skills[1]",
+      "message": "agent \"policy\" names skill \"does-not-exist\", which this package does not ship"
+    },
+    {
+      "severity": "warning",
+      "code": "agent-omitted",
+      "file": "agents.yaml",
+      "path": "agents[1].endpoint",
+      "message": "agent \"risk-analyst\" has no endpoint and is dropped by the loader (not an error)"
+    },
+    {
+      "severity": "error",
+      "code": "agent-skill-unknown",
+      "file": "agents/expense-review-2.yaml",
+      "path": "agent.skills[1]",
+      "message": "agent \"expense-review\" names skill \"check-a-claim\", which this package does not ship"
+    },
+    {
+      "severity": "error",
+      "code": "agent-id-duplicate",
+      "file": "agents/expense-review.yaml",
+      "path": "agent.id",
+      "message": "agent \"expense-review\" is declared in both agents/expense-review-2.yaml and agents/expense-review.yaml"
+    },
+    {
+      "severity": "error",
+      "code": "channel-agent-unknown",
+      "file": "channels.yaml",
+      "path": "channels[1].permitted_agents[0]",
+      "message": "channel references unknown agent \"ghost-agent\""
+    },
+    {
+      "severity": "error",
+      "code": "model-provider-invalid",
+      "file": "model.yaml",
+      "path": "model.provider",
+      "message": "model.provider must be openai or anthropic"
+    }
+  ]
+}

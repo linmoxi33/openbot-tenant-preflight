@@ -1,0 +1,4 @@
+sources:
+  - type: google-drive
+    roots:
+      - finance/policies

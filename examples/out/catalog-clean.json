@@ -1,0 +1,23 @@
+{
+  "tool": "openbot-tenant-preflight",
+  "version": "0.1.0",
+  "command": "catalog",
+  "package": "/home/ubuntu/GitHub/work/trending/openbot-tenant-preflight/examples/in/fintech",
+  "ok": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "catalog_files": 2,
+    "installed": 3,
+    "staged": 1
+  },
+  "findings": [
+    {
+      "severity": "warning",
+      "code": "catalog-already-installed",
+      "file": "catalog/expense-review.yaml",
+      "path": "id",
+      "message": "agent \"expense-review\" is already installed in this package"
+    }
+  ]
+}

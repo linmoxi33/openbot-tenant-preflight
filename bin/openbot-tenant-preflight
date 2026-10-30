@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Offline preflight for OpenBot tenant packages and their catalog/ staging area.
+
+Mirrors the refusal rules of server/src/tenant-package.ts so a package (or a
+coworker file still sitting in catalog/) can be checked before a restart.
+No network access. Exit codes: 0 clean, 1 findings, 2 usage/input error.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - PyYAML ships with Ubuntu's python3
+    sys.stderr.write("error: PyYAML is required (apt package python3-yaml)\n")
+    sys.exit(2)
+
+RESERVED_IDS = {"policy", "fleet", "policy-dry-run"}
+PERSON_BROWSER_ID = re.compile(r"^person-[0-9a-f]{32}$")
+SKILL_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
+TOOL_REF = re.compile(r"^[^/\s]+/[^/\s]+$")
+AGENT_TYPES = {"built-in", "remote-ag-ui", "remote-mastra"}
+REQUIRED_FILES = ("brand.yaml", "agents.yaml", "channels.yaml", "model.yaml", "knowledge.yaml")
+ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+class Findings:
+    def __init__(self):
+        self.items = []
+
+    def add(self, severity, code, file, path, message):
+        self.items.append(
+            {"severity": severity, "code": code, "file": file, "path": path, "message": message}
+        )
+
+    def error(self, code, file, path, message):
+        self.add("error", code, file, path, message)
+
+    def warn(self, code, file, path, message):
+        self.add("warning", code, file, path, message)
+
+    @property
+    def errors(self):
+        return [f for f in self.items if f["severity"] == "error"]
+
+    @property
+    def warnings(self):
+        return [f for f in self.items if f["severity"] == "warning"]
+
+
+def expand(value, env):
+    """`${NAME}` / `${NAME:-fallback}`; an unset name without fallback raises."""
+
+    def sub(match):
+        name, fallback = match.group(1), match.group(2)
+        resolved = env.get(name)
+        if resolved:
+            return resolved
+        if fallback is not None:
+            return fallback
+        raise KeyError(name)
+
+    return ENV_REF.sub(sub, value)
+
+
+def load_yaml(path, findings, rel):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except OSError as exc:
+        findings.error("unreadable-file", rel, "", str(exc))
+        return None
+    except yaml.YAMLError as exc:
+        findings.error("yaml-invalid", rel, "", " ".join(str(exc).split())[:300])
+        return None
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        findings.error("not-a-mapping", rel, "", "top level must be a mapping")
+        return None
+    return data
+
+
+def non_empty(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def check_string_list(value, file, path, findings, label):
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+        findings.error("not-a-string-list", file, path, f"{label} must be an array of strings")
+        return []
+    return value
+
+
+def validate_agent(raw, file, path, findings, skill_slugs, declared_in, agents, env):
+    """One coworker row, following parseAgents() in server/src/tenant-package.ts."""
+    if not isinstance(raw, dict):
+        findings.error("agent-not-a-mapping", file, path, "agent must be a mapping")
+        return None
+    kind = raw.get("type")
+    if kind not in AGENT_TYPES:
+        findings.error(
+            "agent-type-invalid", file, f"{path}.type",
+            "agent.type must be built-in, remote-ag-ui or remote-mastra",
+        )
+        return None
+    agent_id = raw.get("id")
+    if not non_empty(agent_id):
+        findings.error("agent-id-missing", file, f"{path}.id", "agent.id must be a non-empty string")
+        return None
+    agent_id = agent_id.strip()
+    if agent_id in RESERVED_IDS:
+        findings.error(
+            "agent-id-reserved", file, f"{path}.id",
+            f'agent.id "{agent_id}" is reserved for a deployment route and cannot name a Bot',
+        )
+    if PERSON_BROWSER_ID.match(agent_id):
+        findings.error(
+            "agent-id-person-browser", file, f"{path}.id",
+            f'agent.id "{agent_id}" is the shape of a person\'s OpenBot browser and cannot name a Bot',
+        )
+    if agent_id in declared_in:
+        findings.error(
+            "agent-id-duplicate", file, f"{path}.id",
+            f'agent "{agent_id}" is declared in both {declared_in[agent_id]} and {file}',
+        )
+        return None
+
+    title = raw.get("title")
+    if not isinstance(title, str) or len(title.strip()) > 120:
+        findings.error("agent-title-invalid", file, f"{path}.title", "agent.title must be text of 120 characters or fewer")
+    if not non_empty(raw.get("name")):
+        findings.error("agent-name-missing", file, f"{path}.name", "agent.name must be a non-empty string")
+    if not non_empty(raw.get("role_description")):
+        findings.error("agent-role-missing", file, f"{path}.role_description", "agent.role_description must be a non-empty string")
+    if raw.get("avatar_seed") is not None and not non_empty(raw.get("avatar_seed")):
+        findings.error("agent-avatar-invalid", file, f"{path}.avatar_seed", "agent.avatar_seed must be a non-empty string")
+
+    endpoint = ""
+    if isinstance(raw.get("endpoint"), str):
+        try:
+            endpoint = expand(raw["endpoint"], env).strip()
+        except KeyError as exc:
+            findings.error(
+                "agent-endpoint-env-unset", file, f"{path}.endpoint",
+                f"{file} refers to ${{{exc.args[0]}}}, which is not set in this environment.",
+            )
+            endpoint = ""
+    if kind == "built-in":
+        if not non_empty(raw.get("system_prompt")):
+            findings.error("agent-system-prompt-missing", file, f"{path}.system_prompt", "agent.system_prompt must be a non-empty string")
+    elif not endpoint:
+        findings.warn(
+            "agent-omitted", file, f"{path}.endpoint",
+            f'agent "{agent_id}" has no endpoint and is dropped by the loader (not an error)',
+        )
+
+    named = set()
+    for index, slug in enumerate(check_string_list(raw.get("skills"), file, f"{path}.skills", findings, "agent.skills")):
+        if slug in named:
+            findings.error("agent-skill-duplicate", file, f"{path}.skills[{index}]", f'agent "{agent_id}" names skill "{slug}" twice')
+            continue
+        named.add(slug)
+        if skill_slugs is not None and slug not in skill_slugs:
+            findings.error(
+                "agent-skill-unknown", file, f"{path}.skills[{index}]",
+                f'agent "{agent_id}" names skill "{slug}", which this package does not ship',
+            )
+    declared_in[agent_id] = file
+    agents.append(agent_id)
+    return agent_id
+
+
+def load_package_skills(root, findings):
+    path = os.path.join(root, "skills.yaml")
+    if not os.path.exists(path):
+        return set()
+    data = load_yaml(path, findings, "skills.yaml")
+    if data is None:
+        return None
+    value = data.get("skills")
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        findings.error("not-a-list", "skills.yaml", "skills", "skills.yaml skills must be a list")
+        return set()
+    slugs = set()
+    for index, entry in enumerate(value):
+        path_name = f"skills[{index}]"
+        if not isinstance(entry, dict):
+            findings.error("skill-not-a-mapping", "skills.yaml", path_name, "skill must be a mapping")
+            continue
+        slug = entry.get("slug")
+        if not non_empty(slug):
+            findings.error("skill-slug-missing", "skills.yaml", f"{path_name}.slug", "skill.slug must be a non-empty string")
+            continue
+        if slug in slugs:
+            findings.error("skill-slug-duplicate", "skills.yaml", f"{path_name}.slug", f'skill "{slug}" is declared twice in skills.yaml')
+        if not SKILL_SLUG.match(slug):
+            findings.error(
+                "skill-slug-invalid", "skills.yaml", f"{path_name}.slug",
+                f'skill.slug "{slug}" must be lowercase letters, digits and hyphens, 2 to 40 characters, '
+                "starting and ending with a letter or digit",
+            )
+        slugs.add(slug)
+        for field in ("title", "summary", "instructions"):
+            if not non_empty(entry.get(field)):
+                findings.error("skill-field-missing", "skills.yaml", f"{path_name}.{field}", f"skill.{field} must be a non-empty string")
+        for tool_index, ref in enumerate(check_string_list(entry.get("tools"), "skills.yaml", f"{path_name}.tools", findings, "skill.tools")):
+            if not TOOL_REF.match(ref):
+                findings.error(
+                    "skill-tool-ref-invalid", "skills.yaml", f"{path_name}.tools[{tool_index}]",
+                    f'skill.tools entry "{ref}" must be in the form serverId/toolName',
+                )
+    return slugs
+
+
+def check_package(root, findings):
+    env = dict(os.environ)
+    for name in REQUIRED_FILES:
+        if not os.path.exists(os.path.join(root, name)):
+            findings.error("missing-file", name, "", f"{name} is required by the tenant package loader")
+
+    skill_slugs = load_package_skills(root, findings)
+    declared_in = {}
+    agents = []
+
+    agents_yaml_path = os.path.join(root, "agents.yaml")
+    if os.path.exists(agents_yaml_path):
+        data = load_yaml(agents_yaml_path, findings, "agents.yaml")
+        if data is not None:
+            rows = data.get("agents")
+            if not isinstance(rows, list):
+                findings.error("not-a-list", "agents.yaml", "agents", "agents.yaml agents must be a list")
+            else:
+                for index, row in enumerate(rows):
+                    validate_agent(row, "agents.yaml", f"agents[{index}]", findings, skill_slugs, declared_in, agents, env)
+
+    agents_dir = os.path.join(root, "agents")
+    if os.path.isdir(agents_dir):
+        for name in sorted(os.listdir(agents_dir)):
+            if not name.endswith((".yaml", ".yml")):
+                continue
+            rel = f"agents/{name}"
+            data = load_yaml(os.path.join(agents_dir, name), findings, rel)
+            if data is None:
+                continue
+            if "agents" in data:
+                rows = data["agents"]
+                if not isinstance(rows, list):
+                    findings.error("not-a-list", rel, "agents", f"{rel} agents must be a list")
+                    continue
+                for index, row in enumerate(rows):
+                    validate_agent(row, rel, f"agents[{index}]", findings, skill_slugs, declared_in, agents, env)
+            else:
+                validate_agent(data, rel, "agent", findings, skill_slugs, declared_in, agents, env)
+
+    channels_path = os.path.join(root, "channels.yaml")
+    if os.path.exists(channels_path):
+        data = load_yaml(channels_path, findings, "channels.yaml")
+        if data is not None:
+            rows = data.get("channels")
+            if not isinstance(rows, list):
+                findings.error("not-a-list", "channels.yaml", "channels", "channels.yaml channels must be a list")
+            else:
+                seen = set()
+                known = set(agents)
+                for index, row in enumerate(rows):
+                    base = f"channels[{index}]"
+                    if not isinstance(row, dict):
+                        findings.error("channel-not-a-mapping", "channels.yaml", base, "channel must be a mapping")
+                        continue
+                    channel_id = row.get("id")
+                    if not non_empty(channel_id):
+                        findings.error("channel-id-missing", "channels.yaml", f"{base}.id", "channel.id must be a non-empty string")
+                        continue
+                    if channel_id in seen:
+                        findings.error("channel-id-duplicate", "channels.yaml", f"{base}.id", f'channel "{channel_id}" is declared twice in channels.yaml')
+                    seen.add(channel_id)
+                    for field in ("name", "description"):
+                        if not non_empty(row.get(field)):
+                            findings.error("channel-field-missing", "channels.yaml", f"{base}.{field}", f"channel.{field} must be a non-empty string")
+                    permitted = check_string_list(row.get("permitted_agents"), "channels.yaml", f"{base}.permitted_agents", findings, "channel.permitted_agents")
+                    if len(set(permitted)) != len(permitted):
+                        findings.error("channel-agent-duplicate", "channels.yaml", f"{base}.permitted_agents", f'channel "{channel_id}" lists the same agent twice')
+                    for agent_index, agent_id in enumerate(permitted):
+                        if agent_id not in known:
+                            findings.error(
+                                "channel-agent-unknown", "channels.yaml", f"{base}.permitted_agents[{agent_index}]",
+                                f'channel references unknown agent "{agent_id}"',
+                            )
+                    check_string_list(row.get("allowed_groups"), "channels.yaml", f"{base}.allowed_groups", findings, "channel.allowed_groups")
+
+    model_path = os.path.join(root, "model.yaml")
+    if os.path.exists(model_path):
+        data = load_yaml(model_path, findings, "model.yaml")
+        if data is not None:
+            model = data.get("model")
+            if not isinstance(model, dict):
+                findings.error("model-missing", "model.yaml", "model", "model must be a mapping")
+            elif model.get("provider") not in ("openai", "anthropic"):
+                findings.error("model-provider-invalid", "model.yaml", "model.provider", "model.provider must be openai or anthropic")
+
+    knowledge_path = os.path.join(root, "knowledge.yaml")
+    if os.path.exists(knowledge_path):
+        data = load_yaml(knowledge_path, findings, "knowledge.yaml")
+        if data is not None:
+            rows = data.get("sources")
+            if not isinstance(rows, list):
+                findings.error("not-a-list", "knowledge.yaml", "sources", "knowledge.yaml sources must be a list")
+            else:
+                for index, row in enumerate(rows):
+                    base = f"sources[{index}]"
+                    if not isinstance(row, dict):
+                        findings.error("source-not-a-mapping", "knowledge.yaml", base, "knowledge source must be a mapping")
+                        continue
+                    if row.get("type") not in ("google-drive", "microsoft-onedrive"):
+                        findings.error("source-type-unsupported", "knowledge.yaml", f"{base}.type", "knowledge source type is not supported")
+                    check_string_list(row.get("roots"), "knowledge.yaml", f"{base}.roots", findings, "source.roots")
+
+    brand_path = os.path.join(root, "brand.yaml")
+    if os.path.exists(brand_path):
+        data = load_yaml(brand_path, findings, "brand.yaml")
+        if data is not None:
+            tenant = data.get("tenant")
+            if not isinstance(tenant, dict):
+                findings.error("brand-tenant-missing", "brand.yaml", "tenant", "brand.tenant must be a mapping")
+            else:
+                for field in ("id", "product_name"):
+                    if not non_empty(tenant.get(field)):
+                        findings.error("brand-field-missing", "brand.yaml", f"tenant.{field}", f"brand.tenant.{field} must be a non-empty string")
+
+    return {"agents": len(agents), "skills": len(skill_slugs or ()), "agent_ids": agents}
+
+
+def check_catalog(root, findings):
+    """Validate catalog/*.yaml as standalone coworker files the loader never reads."""
+    env = dict(os.environ)
+    catalog = os.path.join(root, "catalog")
+    if not os.path.isdir(catalog):
+        findings.error("catalog-missing", "catalog/", "", "catalog/ directory not found")
+        return {"catalog_files": 0, "installed": 0, "staged": 0}
+
+    skill_slugs = load_package_skills(root, findings)
+    installed = set()
+    agents_yaml_path = os.path.join(root, "agents.yaml")
+    if os.path.exists(agents_yaml_path):
+        data = load_yaml(agents_yaml_path, findings, "agents.yaml")
+        if isinstance(data, dict) and isinstance(data.get("agents"), list):
+            for row in data["agents"]:
+                if isinstance(row, dict) and non_empty(row.get("id")):
+                    installed.add(row["id"].strip())
+    agents_dir = os.path.join(root, "agents")
+    if os.path.isdir(agents_dir):
+        for name in sorted(os.listdir(agents_dir)):
+            if name.endswith((".yaml", ".yml")):
+                data = load_yaml(os.path.join(agents_dir, name), findings, f"agents/{name}")
+                if isinstance(data, dict):
+                    rows = data["agents"] if isinstance(data.get("agents"), list) else [data]
+                    for row in rows:
+                        if isinstance(row, dict) and non_empty(row.get("id")):
+                            installed.add(row["id"].strip())
+
+    total = 0
+    staged = 0
+    seen = {}
+    for name in sorted(os.listdir(catalog)):
+        if not name.endswith((".yaml", ".yml")):
+            continue
+        total += 1
+        rel = f"catalog/{name}"
+        data = load_yaml(os.path.join(catalog, name), findings, rel)
+        if data is None:
+            continue
+        rows = data["agents"] if isinstance(data.get("agents"), list) else [data]
+        for index, row in enumerate(rows):
+            path = f"agents[{index}]" if isinstance(data.get("agents"), list) else "agent"
+            agent_id = validate_agent(row, rel, path, findings, skill_slugs, seen, [], env)
+            if agent_id is None:
+                continue
+            if agent_id in installed:
+                findings.warn("catalog-already-installed", rel, f"{path}.id".lstrip("."), f'agent "{agent_id}" is already installed in this package')
+            else:
+                staged += 1
+    return {"catalog_files": total, "installed": len(installed), "staged": staged}
+
+
+def render_text(result):
+    lines = []
+    for finding in result["findings"]:
+        where = finding["file"] + ((" " + finding["path"]) if finding["path"] else "")
+        lines.append(f'{finding["severity"].upper():7} {finding["code"]:26} {where}: {finding["message"]}')
+    summary = result["summary"]
+    lines.append(
+        f'{result["command"]}: {summary["errors"]} error(s), {summary["warnings"]} warning(s) '
+        f'in {result["package"]}'
+    )
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="openbot-tenant-preflight",
+        description="Offline preflight for OpenBot tenant packages and catalog/ coworker files.",
+    )
+    parser.add_argument("command", choices=["check", "catalog"], help="check a package, or validate catalog/ files")
+    parser.add_argument("package", help="path to a tenant package directory (contains agents.yaml)")
+    parser.add_argument("--json", action="store_true", help="emit one JSON object on stdout")
+    args = parser.parse_args(argv)
+
+    root = os.path.abspath(args.package)
+    if not os.path.isdir(root):
+        sys.stderr.write(f"error: {args.package} is not a directory\n")
+        return 2
+    if not os.path.exists(os.path.join(root, "agents.yaml")):
+        sys.stderr.write(f"error: {args.package} has no agents.yaml; not a tenant package\n")
+        return 2
+
+    findings = Findings()
+    if args.command == "check":
+        stats = check_package(root, findings)
+    else:
+        stats = check_catalog(root, findings)
+
+    result = {
+        "tool": "openbot-tenant-preflight",
+        "version": "0.1.0",
+        "command": args.command,
+        "package": root,
+        "ok": len(findings.errors) == 0,
+        "summary": {
+            "errors": len(findings.errors),
+            "warnings": len(findings.warnings),
+            **stats,
+        },
+        "findings": findings.items,
+    }
+    if args.json:
+        json.dump(result, sys.stdout, indent=2, sort_keys=False)
+        sys.stdout.write("\n")
+    else:
+        print(render_text(result))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

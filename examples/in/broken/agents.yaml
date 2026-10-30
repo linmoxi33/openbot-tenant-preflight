@@ -1,0 +1,18 @@
+agents:
+  - id: policy
+    name: General Assistant
+    title: Everyday Work
+    role_description: Help with everyday work using clear, concise, and accurate answers.
+    avatar_seed: general-assistant
+    type: built-in
+    system_prompt: You are a helpful general assistant.
+    skills:
+      - find-a-document
+      - does-not-exist
+  - id: risk-analyst
+    name: Risk Analyst
+    title: Risk & Compliance
+    role_description: Investigate policies, transaction monitoring, and control evidence.
+    avatar_seed: risk-analyst
+    type: remote-ag-ui
+    endpoint: ${MANAGED_AGENT_AG_UI_URL:-}

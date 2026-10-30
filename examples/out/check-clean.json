@@ -1,0 +1,27 @@
+{
+  "tool": "openbot-tenant-preflight",
+  "version": "0.1.0",
+  "command": "check",
+  "package": "/home/ubuntu/GitHub/work/trending/openbot-tenant-preflight/examples/in/fintech",
+  "ok": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "agents": 3,
+    "skills": 2,
+    "agent_ids": [
+      "general-assistant",
+      "risk-analyst",
+      "expense-review"
+    ]
+  },
+  "findings": [
+    {
+      "severity": "warning",
+      "code": "agent-omitted",
+      "file": "agents.yaml",
+      "path": "agents[1].endpoint",
+      "message": "agent \"risk-analyst\" has no endpoint and is dropped by the loader (not an error)"
+    }
+  ]
+}

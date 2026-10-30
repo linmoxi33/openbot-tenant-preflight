@@ -1,0 +1,14 @@
+channels:
+  - id: finance
+    name: Finance
+    description: Finance operations and expense questions.
+    permitted_agents:
+      - expense-review
+    allowed_groups:
+      - finance
+  - id: everyone
+    name: Everyone
+    description: General questions for the whole company.
+    permitted_agents:
+      - general-assistant
+    allowed_groups: []

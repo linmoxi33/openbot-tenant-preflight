@@ -1,0 +1,13 @@
+skills:
+  - slug: find-a-document
+    title: Find a document
+    summary: Search a connected document source and cite what was used.
+    instructions: Search the connected source, then quote the passage you relied on.
+    tools:
+      - drive/search
+  - slug: Check_A_Claim
+    title: Check a claim
+    summary: Compare a claim line against the written policy.
+    instructions: Quote the clause that sets the limit; never infer a limit from memory.
+    tools:
+      - drive/search
